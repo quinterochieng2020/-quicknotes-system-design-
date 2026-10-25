@@ -1,24 +1,105 @@
-[ Clients (Mobile / Web App) ]
-                     |
-                     v
-             [ CDN (Cloudflare) ] ---- (Cached Photos / Thumbnails)
-                     |
-                     v
-           [ Load Balancer (LB) ]
-                     |
-         +-----------+-----------+
-         |                       |
-         v                       v
-  [ App Server 1 ]        [ App Server 2 ]
-         |                       |
-         +-----------+-----------+
-                     |
-         +-----------+-----------+---------+
-         |           |           |         |
-         v           v           v         v
-    [ Cache ]     [ DB Write ]  [ Queue ]  [ Object Storage ]
-    (Redis)      (Primary)      (Kafka)    (AWS S3 / GCS)
-                     |              |
-                     v              v
-               [ DB Read ]     [ Worker ]
-               (Replica)   (Thumbnail Gen)
+---
+
+### `docs/architecture.md`
+
+```markdown
+# QuickNotes Architecture
+
+## Requirements
+
+### Functional Requirements
+* Users can sign up, log in, and authenticate securely.
+* Users can create, read, update, and delete notes.
+* Users can organize notes using custom tags.
+
+### Non-Functional Requirements
+* **Availability:** 99.9% uptime.
+* **Latency:** Sub-100ms response time for note retrieval.
+* **Scalability:** Ability to support 1 million active users with predictable horizontal scale.
+
+---
+
+## Load Estimate (1 Million Users)
+* **Assumptions:** 
+  * 1,000,000 active users.
+  * 10% Daily Active Users (DAU) = 100,000 DAU.
+  * Each active user performs an average of 10 read operations and 2 write operations per day.
+* **Reads Per Second (RPS):** 
+  * $100,000 \times 10 = 1,000,000$ reads/day.
+  * Average RPS = $\frac{1,000,000}{86,400} \approx 11.5$ RPS (Peak traffic multiplier of $5\times \approx 60$ RPS).
+* **Writes Per Second (WPS):** 
+  * $100,000 \times 2 = 200,000$ writes/day.
+  * Average WPS = $\frac{200,000}{86,400} \approx 2.3$ WPS (Peak traffic multiplier of $5\times \approx 12$ WPS).
+* **Storage Per Year:** 
+  * Assuming each note is ~1 KB and each user creates 2 notes per day: $200,000 \text{ notes/day} \times 365 = 73,000,000$ notes/year.
+  * Total storage = $73 \text{ GB/year}$ of raw text data (excluding indexes and backups).
+
+---
+
+## Architecture Diagram
+
+```text
+[Client] --> [DNS (Cloudflare)] --> [CDN (Static Assets)]
+                                          |
+                                          v
+                                    [Load Balancer]
+                                     /            \
+                       [App Server 1]              [App Server 2]
+                            |                            |
+                 +----------+----------+                 |
+                 |                     |                 |
+                 v                     v                 v
+            [Redis Cache]     [Primary Database] <--- [Read Replica]
+                                       ^
+                                       |
+                             [Queue & Worker Service]
+Component Overview
+Client: The web or mobile frontend interface used by customers to interact with the platform.
+
+DNS: Resolves domain names to IP addresses and routes initial traffic securely.
+
+CDN: Caches and serves static assets close to users to reduce origin server load.
+
+Load Balancer: Distributes incoming HTTP request traffic evenly across multiple application servers.
+
+App Servers: Stateless backend services that execute business logic and process API requests.
+
+Cache: In-memory key-value store (Redis) used to cache frequently accessed notes and session data.
+
+Primary Database: Handles all write operations and guarantees data consistency.
+
+Read Replica: Replicates data from the primary database to serve read-heavy queries.
+
+Queue & Worker: Asynchronous background processor handling heavy tasks like email notifications or analytics logging.
+
+Request Flow
+1. GET /notes Flow
+Client sends a GET request resolved via DNS and routed through the Load Balancer to an App Server.
+
+App Server checks the Redis Cache for the user's cached note list.
+
+If cache hits, data is returned instantly. If cache misses, the App Server queries the Read Database Replica.
+
+The database returns the note rows, the App Server populates the cache, and the JSON payload is returned to the client.
+
+2. POST /notes Flow
+Client sends a POST request with note payload through the Load Balancer to an App Server.
+
+App Server validates user authentication token and request body constraints.
+
+App Server executes an INSERT query on the Primary Database.
+
+Primary Database commits the transaction and replicates the write to the Read Replica.
+
+App Server invalidates related user cache entries in Redis and responds with 201 Created.
+
+Trade-offs & Single Points of Failure (SPOF) Mitigation
+Trade-off 1 (Consistency vs Performance): We use database read replicas to scale read traffic, which introduces a slight replication lag (eventual consistency) for read operations right after a write.
+
+Trade-off 2 (Complexity vs Speed): Introducing an asynchronous queue layer adds architectural complexity, but decouples long-running background tasks from the synchronous request-response cycle.
+
+SPOF Mitigation:
+
+Load Balancers & App Servers: Deployed in redundant clusters behind health-checked groups so traffic auto-fails over if an instance drops.
+
+Databases: Configured with an active Primary instance and automated failover to the Read Replica in case of hardware failure.
