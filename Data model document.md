@@ -1,8 +1,4 @@
----
-
-### `docs/data-model.md`
-
-```markdown
+Markdown
 # QuickNotes Data Model
 
 ## Entities & Schema
